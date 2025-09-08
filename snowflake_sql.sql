@@ -1,0 +1,556 @@
+-- Snowflake_environment_setup
+
+-- Create database and schemas
+CREATE OR REPLACE DATABASE SALES_ANALYTICS_DB;
+CREATE OR REPLACE SCHEMA SALES_ANALYTICS_DB.RAW; -- For incoming data
+CREATE OR REPLACE SCHEMA SALES_ANALYTICS_DB.ANALYTICS; -- For business tables
+
+
+-- Create warehouse for processing
+CREATE WAREHOUSE LEARNING_WH
+ WAREHOUSE_SIZE = XSMALL
+ AUTO_SUSPEND = 60
+ AUTO_RESUME = TRUE;
+
+
+-- Basic security setup
+CREATE OR REPLACE ROLE ANALYST_ROLE;
+GRANT USAGE ON DATABASE SALES_ANALYTICS_DB TO ROLE ANALYST_ROLE;
+GRANT USAGE ON SCHEMA SALES_ANALYTICS_DB.ANALYTICS TO ROLE ANALYST_ROLE;
+GRANT SELECT ON ALL TABLES IN SCHEMA SALES_ANALYTICS_DB.ANALYTICS TO ROLE 
+ANALYST_ROLE;
+
+
+-- Data ingestion
+
+
+use SALES_ANALYTICS_DB.RAW;
+
+CREATE OR REPLACE FILE FORMAT FF
+STRIP_OUTER_ARRAY = TRUE
+TYPE='json';
+
+CREATE OR REPLACE STAGE INTERNAL_STAGE
+FILE_FORMAT= FF;
+
+
+LIST @SALES_ANALYTICS_DB.RAW.INTERNAL_STAGE;
+
+CREATE OR REPLACE TABLE SALES_ANALYTICS_DB.RAW.TEMP (
+v VARIANT
+);
+
+CREATE OR REPLACE PIPE SNOW
+AUTO_INGEST = FALSE
+AS
+COPY INTO SALES_ANALYTICS_DB.RAW.TEMP
+FROM @SALES_ANALYTICS_DB.RAW.INTERNAL_STAGE;
+
+-- SELECT SYSTEM$PIPE_STATUS('SALES_ANALYTICS_DB.RAW.SNOW');
+-- SELECT * FROM TABLE(INFORMATION_SCHEMA.COPY_HISTORY(TABLE_NAME=>'TEMP', START_TIME=>DATEADD(hours, -1, CURRENT_TIMESTAMP())));
+
+CREATE OR REPLACE TASK TK
+SCHEDULE = '10 SECONDS'
+AS
+ALTER PIPE SALES_ANALYTICS_DB.RAW.SNOW REFRESH;
+
+SELECT * FROM SALES_ANALYTICS_DB.RAW.TEMP;
+
+ALTER TASK TK RESUME;
+
+
+-- Table for raw incoming data
+CREATE OR REPLACE TRANSIENT TABLE SALES_ANALYTICS_DB.RAW.SALES_STAGING (
+ order_id STRING,
+ product_id STRING,
+ product_name STRING,
+ CATEGORY STRING,
+ quantity INTEGER,
+ unit_price DECIMAL(10,2),
+ total_amount DECIMAL(10,2),
+ region STRING,
+ order_timestamp TIMESTAMP_NTZ
+);
+
+create or replace stream st on table SALES_ANALYTICS_DB.RAW.TEMP
+append_only = true;
+select * from st;
+
+CREATE OR REPLACE TASK TK1
+AFTER TK
+AS
+INSERT INTO SALES_STAGING (ORDER_ID, PRODUCT_ID, PRODUCT_NAME, CATEGORY, QUANTITY, UNIT_PRICE, TOTAL_AMOUNT, REGION, ORDER_TIMESTAMP)
+SELECT v:order_id, v:product_id, v:product_name, v:category, v:quantity, v:unit_price, v:total_amount, v:region, v:order_timestamp
+from st;
+
+SELECT * FROM SALES_STAGING;
+
+
+create or replace stream SALES_ANALYTICS_DB.ANALYTICS.gold_stream on TABLE  SALES_ANALYTICS_DB.RAW.SALES_STAGING;
+create or replace stream SALES_ANALYTICS_DB.ANALYTICS.prod_stream on TABLE  SALES_ANALYTICS_DB.RAW.SALES_STAGING;
+
+
+ALTER TASK TK SUSPEND;
+ALTER TASK TK1 SUSPEND;
+ALTER TASK TK2 SUSPEND;
+
+ALTER TASK TK RESUME;
+ALTER TASK TK1 RESUME;
+ALTER TASK TK2 RESUME;
+
+
+
+-- create or replace stream st on test.sc.temp
+-- append_only = true;
+
+
+select * from st;
+select * from sales_staging;
+
+
+-- Data ingestion into analytics layer
+
+USE SALES_ANALYTICS_DB.ANALYTICS;
+
+--creating fact sales table
+CREATE OR REPLACE TABLE  SALES_ANALYTICS_DB.ANALYTICS.FACT_SALES (
+    sale_id int autoincrement(1,1),
+    order_id STRING,
+    product_id STRING,
+    region STRING,
+    quantity INTEGER,
+    total_amount DECIMAL(10,2),
+    sale_date DATE,
+    sale_timestamp TIMESTAMP_NTZ
+) CLUSTER BY (sale_date, region);
+
+--creating dim product table
+CREATE or replace TABLE SALES_ANALYTICS_DB.ANALYTICS.DIM_PRODUCT (
+    product_id STRING PRIMARY KEY,
+    product_name STRING,
+    category STRING,
+    unit_price DECIMAL(10,2)
+);
+
+create or replace table SALES_ANALYTICS_DB.ANALYTICS.dim_calendar
+(
+    date_key date primary key,
+    year int,
+    Q int,
+    day int,
+    day_name string,
+    month int,
+    month_name string,
+    is_weekend boolean    
+);
+
+
+
+INSERT INTO SALES_ANALYTICS_DB.ANALYTICS.dim_calendar (
+    date_key,
+    year,
+    q,
+    day,
+    day_name,
+    month,
+    month_name,
+    is_weekend
+)
+WITH date_range AS (
+    SELECT DATE('2025-01-01') AS date_val
+    UNION ALL
+    SELECT DATEADD(DAY, 1, date_val)
+    FROM date_range
+    WHERE date_val < DATE('2027-12-31')
+)
+SELECT
+    date_val,
+    EXTRACT(YEAR FROM date_val) AS year,
+    CEIL(EXTRACT(MONTH FROM date_val) / 3) AS q,   -- Snowflake has no QUARTER() function
+    EXTRACT(DAY FROM date_val) AS day,
+    DAYNAME(date_val) AS day_name,
+    EXTRACT(MONTH FROM date_val) AS month,
+    MONTHNAME(date_val) AS month_name,
+    CASE WHEN DAYOFWEEK(date_val) IN (0, 6) THEN TRUE ELSE FALSE END AS is_weekend
+FROM date_range;
+--creating stored procedure
+CREATE OR REPLACE PROCEDURE SALES_ANALYTICS_DB.ANALYTICS.PROCESS_NEW_SALES()
+RETURNS STRING
+LANGUAGE SQL
+AS
+
+BEGIN
+
+    INSERT INTO  SALES_ANALYTICS_DB.ANALYTICS.FACT_SALES(order_Id,product_id,region,quantity,total_amount,sale_date,sale_timestamp)
+    SELECT 
+        order_id,
+        product_id,
+        region,
+        quantity,
+        total_amount,
+        DATE(order_timestamp),
+        order_timestamp
+    FROM  SALES_ANALYTICS_DB.ANALYTICS.GOLD_STREAM;
+
+    -----------------------------------------------------
+    MERGE INTO  SALES_ANALYTICS_DB.ANALYTICS.DIM_PRODUCT t
+    USING (
+        SELECT product_id, product_name,category, unit_price,METADATA$ACTION, METADATA$ISUPDATE
+        from  SALES_ANALYTICS_DB.ANALYTICS.prod_stream
+    ) s
+    on s.product_id = t.product_id
+    
+    when matched 
+    and s.METADATA$ACTION = 'INSERT'
+    and s.METADATA$ISUPDATE = TRUE
+    then update 
+    set
+    t.product_id = s.product_id,
+    t.product_name = s.product_name,
+    t.category = s.category,
+    t.unit_price = s.unit_price
+    
+    when not matched
+    then insert (product_id,product_name,category,unit_price)
+    values (s.product_id,s.product_name,s.category,s.unit_price);
+    RETURN 'Processed new sales data';
+END;
+
+--creating task to call stored procedure
+CREATE OR REPLACE TASK SALES_ANALYTICS_DB.RAW.TK2
+AFTER SALES_ANALYTICS_DB.RAW.TK1
+AS
+CALL  SALES_ANALYTICS_DB.ANALYTICS.PROCESS_NEW_SALES();
+
+
+ALTER TASK SALES_ANALYTICS_DB.RAW.TK2 RESUME;
+ALTER TASK SALES_ANALYTICS_DB.RAW.TK2 SUSPEND;
+SELECT * FROM GOLD_STREAM;
+select * from prod_stream;
+SELECT * FROM FACT_SALES;
+SELECT * FROM DIM_PRODUCT;
+select * from dim_calendar;
+
+
+
+--MATERIALIZED VIEW FOR SALES PER MINUTE
+
+CREATE OR REPLACE MATERIALIZED VIEW  SALES_ANALYTICS_DB.ANALYTICS.SPM
+AS
+SELECT 
+DATE_TRUNC('minute',sale_timestamp) as mins,
+count(sale_id) as tot_sales
+from fact_sales
+group by mins;
+
+
+SELECT * FROM SPM;
+
+
+
+--MATERIALIZED VIEW SALES BY REGION
+create or replace Materialized view  SALES_ANALYTICS_DB.ANALYTICS.SPR
+as 
+select region,
+sum(total_amount) as Revenue,
+COUNT(SALE_ID) AS NO_OF_SALES,
+DATE_TRUNC('minute',sale_timestamp) as mins,
+count(sale_id) as tot_sales
+from fact_sales 
+group by region,mins;
+
+SELECT * FROM SPR;
+
+--MATERIALIZED VIEW TOP PRODUCTS
+-- CREATE OR REPLACE TABLE TOP_PROD
+-- (
+--     PRODUCT_NAME STRING,
+--     CATEGORY STRING,
+--     REVENUE FLOAT
+-- );
+
+
+-- CREATE OR REPLACE TASK TK3
+-- AFTER TK2
+-- AS
+-- INSERT INTO TOP_PROD (PRODUCT_NAME,CATEGORY, REVENUE)
+-- SELECT
+-- P.PRODUCT_NAME,
+-- P.CATEGORY,
+-- SUM(TOTAL_AMOUNT) AS PRODUCT_REVENUE
+-- FROM
+-- FACT_SALES F JOIN DIM_PRODUCT P
+-- ON F.PRODUCT_ID = P.PRODUCT_ID
+-- GROUP BY PRODUCT_NAME,CATEGORY
+-- ORDER BY SUM(TOTAL_AMOUNT) DESC;
+
+
+
+-- CREATE OR REPLACE MATERIALIZED VIEW TP
+-- AS
+-- SELECT
+-- PRODUCT_NAME,
+-- REVENUE
+-- FROM TOP_PROD;
+
+
+
+-- MATERIALIZED VIEW TOP CATEGORY
+-- CREATE OR REPLACE MATERIALIZED VIEW TC
+-- AS
+-- SELECT 
+-- CATEGORY,
+-- SUM(REVENUE) AS TOT_REVENUE_BY_CATEGORY
+-- FROM TOP_PROD
+-- GROUP BY CATEGORY;
+
+-- ALTER TASK TK3 RESUME;
+
+-- VIEW FOR TOP_PRODUCTS
+CREATE OR REPLACE VIEW TOP_PRODUCTS
+AS
+SELECT 
+TOP 5
+P.PRODUCT_NAME,
+SUM(TOTAL_AMOUNT) AS REVENUE,
+FROM FACT_SALES F JOIN DIM_PRODUCT P
+ON P.PRODUCT_ID = F.PRODUCT_ID
+GROUP BY P.PRODUCT_NAME
+ORDER BY SUM(TOTAL_AMOUNT) DESC;
+
+
+--VIEW FOR TOP_CATEGORY
+CREATE OR REPLACE VIEW TOP_CATEGORY
+AS
+SELECT 
+TOP 5
+P.CATEGORY,
+SUM(TOTAL_AMOUNT) AS REVENUE,
+FROM FACT_SALES F JOIN DIM_PRODUCT P
+ON P.PRODUCT_ID = F.PRODUCT_ID
+GROUP BY P.CATEGORY
+ORDER BY SUM(TOTAL_AMOUNT) DESC;
+
+
+-- DROP MATERIALIZED VIEW TP;
+-- DROP MATERIALIZED VIEW TC;
+-- DROP TABLE TOP_PROD;
+-- DROP TASK TK3;
+select * from spm;
+SELECT * FROM SPR;
+SELECT * FROM TOP_PRODUCTS;
+SELECT * FROM TOP_CATEGORY;
+SHOW TASKS;
+
+
+CREATE OR REPLACE materialized VIEW KPI1
+AS
+SELECT 
+SUM(TOTAL_AMOUNT) AS TOTAL_REVENUE,
+COUNT(DISTINCT ORDER_ID) AS TOTAL_ORDERS,
+SUM(QUANTITY) AS TOTAL_UNITS,
+AVG(TOTAL_AMOUNT) AS AVG_ORDER_VALUE
+FROM FACT_SALES;
+
+SELECT * FROM KPI;
+
+
+-- Monitoring and troubleshooting
+
+
+-- Monitor pipe activity
+SELECT * FROM TABLE(INFORMATION_SCHEMA.PIPE_USAGE_HISTORY(
+ DATE_RANGE_START=>DATEADD('hour',-1,CURRENT_TIMESTAMP()),
+ PIPE_NAME=>'SALES_ANALYTICS_DB.RAW.SNOW'
+));
+
+-- Check task execution
+SELECT *
+FROM TABLE(INFORMATION_SCHEMA.TASK_HISTORY())
+WHERE NAME = 'TK'
+ORDER BY SCHEDULED_TIME DESC
+LIMIT 10;
+
+-- Check task execution
+SELECT *
+FROM TABLE(INFORMATION_SCHEMA.TASK_HISTORY())
+WHERE NAME = 'TK1'
+ORDER BY SCHEDULED_TIME DESC
+LIMIT 10;
+
+
+-- Check task execution
+SELECT *
+FROM TABLE(INFORMATION_SCHEMA.TASK_HISTORY())
+WHERE NAME = 'TK2'
+ORDER BY SCHEDULED_TIME DESC
+LIMIT 10;
+
+-- Monitor warehouse usage
+SELECT 
+*
+FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_LOAD_HISTORY
+WHERE WAREHOUSE_NAME = 'LEARNING_WH'
+ORDER BY START_TIME DESC
+LIMIT 20;
+
+
+-- Data sharing and integration
+
+-- Create a data share for external access
+USE ROLE ROLE_ADMIN;
+CREATE SHARE SALES_SHARE;
+GRANT USAGE ON DATABASE SALES_ANALYTICS_DB TO SHARE SALES_SHARE;
+GRANT USAGE ON SCHEMA SALES_ANALYTICS_DB.ANALYTICS TO SHARE SALES_SHARE;
+GRANT SELECT ON TABLE SALES_ANALYTICS_DB.ANALYTICS.FACT_SALES TO SHARE 
+SALES_SHARE;
+
+-- Add accounts that can access this share (replace with actual account names)
+ALTER SHARE SALES_SHARE
+ADD ACCOUNTS = ('ORG_NAME.ACCOUNT_NAME');
+
+-- Optional: Create External Table for querying blob storage data without loading
+USE ROLE ROLE_DEVELOPER;
+CREATE OR REPLACE EXTERNAL TABLE SALES_ANALYTICS_DB.RAW.EXT_SALES_DATA (
+ order_id STRING,
+ product_id STRING,
+ product_name STRING,
+ quantity INT,
+ price FLOAT,
+ region STRING,
+ order_ts TIMESTAMP_NTZ
+)
+WITH LOCATION = @SALES_ANALYTICS_DB.RAW.INTERNAL_STAGE
+FILE_FORMAT = SALES_ANALYTICS_DB.RAW.FF
+AUTO_REFRESH = FALSE;
+
+
+-- Data Governance and Auditing
+
+-- Review Access History
+USE ROLE ROLE_ADMIN;
+SELECT *
+FROM SNOWFLAKE.ACCOUNT_USAGE.ACCESS_HISTORY
+WHERE OBJECT_NAME = 'FACT_SALES'
+ORDER BY EVENT_TIME DESC
+LIMIT 10;
+
+
+-- Tag Sensitive Data for classification
+CREATE OR REPLACE TAG SENSITIVE_TAG COMMENT = 'Contains PII or sensitive info';
+ALTER TABLE SALES_ANALYTICS_DB.ANALYTICS.FACT_SALES
+SET TAG SENSITIVE_TAG = 'Revenue data';
+
+
+-- Monitor Query Usage for optimization
+SELECT *
+FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
+WHERE QUERY_TEXT ILIKE '%FACT_SALES%'
+ORDER BY START_TIME DESC
+LIMIT 10;
+
+
+-- Track data lineage and usage patterns
+SELECT 
+ TABLE_NAME,
+ LAST_ALTERED,
+ ROW_COUNT,
+ BYTES,
+ RETENTION_TIME
+FROM SNOWFLAKE.ACCOUNT_USAGE.TABLES
+WHERE TABLE_SCHEMA = 'ANALYTICS'
+ORDER BY LAST_ALTERED DESC;
+
+
+-- Time Travel and fail-safe
+
+
+-- Query data from 1 hour ago
+USE ROLE ROLE_DEVELOPER;
+SELECT *
+FROM SALES_ANALYTICS_DB.ANALYTICS.FACT_SALES
+AT (OFFSET => -60*60); -- 60 minutes * 60 seconds
+
+-- Query data from a specific timestamp
+SELECT *
+FROM SALES_ANALYTICS_DB.ANALYTICS.FACT_SALES
+AT (TIMESTAMP => TO_TIMESTAMP('2025-08-22 12:00:00'));
+
+-- Recover dropped table (if accidentally deleted)
+UNDROP TABLE SALES_ANALYTICS_DB.ANALYTICS.FACT_SALES;
+
+-- Restore table to a point-in-time snapshot
+CREATE OR REPLACE TABLE SALES_FACT_RESTORE AS
+SELECT *
+FROM SALES_ANALYTICS_DB.ANALYTICS.FACT_SALES
+AT (TIMESTAMP => TO_TIMESTAMP('2025-08-22 12:00:00'));
+
+-- Check Time Travel retention for your tables
+SHOW TABLES LIKE 'FACT_SALES';
+
+
+-- Cloning and zero-copy operations
+
+
+-- Clone Table (zero-copy - instant operation)
+USE ROLE ROLE_DEVELOPER;
+CREATE TABLE FACT_SALES_CLONE CLONE 
+SALES_ANALYTICS_DB.ANALYTICS.FACT_SALES;
+
+-- Clone entire Schema for development environment
+CREATE SCHEMA SALES_ANALYTICS_DB.ANALYTICS_DEV CLONE 
+SALES_ANALYTICS_DB.ANALYTICS;
+
+-- Clone entire Database for comprehensive backup
+CREATE DATABASE SALES_ANALYTICS_DB_BACKUP CLONE SALES_ANALYTICS_DB;
+
+-- Clone from a specific point in time
+CREATE TABLE FACT_SALES_YESTERDAY CLONE 
+SALES_ANALYTICS_DB.ANALYTICS.FACT_SALES
+AT (OFFSET => -86400); -- 24 hours ago
+
+-- Monitor clone relationships
+SHOW TABLES LIKE '%CLONE%';
+
+
+
+-- Advanced Materialized Views
+
+
+-- Advanced product performance materialized view
+CREATE OR REPLACE MATERIALIZED VIEW 
+SALES_ANALYTICS_DB.ANALYTICS.MV_TOP_PRODUCTS AS
+SELECT 
+ product_id,
+ SUM(quantity) AS total_units,
+ SUM(total_amount) AS total_revenue,
+ COUNT(DISTINCT order_id) AS total_orders,
+ AVG(total_amount) AS avg_order_value
+FROM SALES_ANALYTICS_DB.ANALYTICS.FACT_SALES
+GROUP BY product_id;
+
+-- Query the materialized view for top products
+SELECT *
+FROM SALES_ANALYTICS_DB.ANALYTICS.MV_TOP_PRODUCTS
+ORDER BY total_revenue DESC
+LIMIT 5;
+
+-- Monitor refresh history and performance
+SELECT *
+FROM TABLE(INFORMATION_SCHEMA.MATERIALIZED_VIEW_REFRESH_HISTORY())
+WHERE NAME = 'MV_TOP_PRODUCTS'
+ORDER BY LAST_REFRESH_START_TIME DESC;
+
+-- Time-based sales aggregation for trending analysis
+CREATE OR REPLACE MATERIALIZED VIEW 
+SALES_ANALYTICS_DB.ANALYTICS.MV_HOURLY_SALES AS
+SELECT 
+ DATE_TRUNC('hour', sale_timestamp) as hour_bucket,
+ region,
+ COUNT(*) as transaction_count,
+ SUM(total_amount) as revenue,
+ AVG(total_amount) as avg_order_value
+FROM SALES_ANALYTICS_DB.ANALYTICS.FACT_SALES
+WHERE sale_timestamp >= DATEADD('day', -7, CURRENT_TIMESTAMP())
+GROUP BY 1, 2
+ORDER BY 1 DESC, 3 DESC
